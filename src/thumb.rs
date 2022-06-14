@@ -73,14 +73,15 @@ pub fn analyze(
                     }
 
                     continue;
-                } else {
-                    // continues until the end of the binary; we won't find more instructions so
-                    // let's stop decoding
-                    break;
                 }
+
+                // continues until the end of the binary; we won't find more instructions so
+                // let's stop decoding
+                break;
             }
         }
 
+        #[allow(clippy::if_same_then_else)]
         if matches(first, "0b010000_0101_xxx_xxx") {
             // A7.7.2 ADC (register) - T1
             continue;
@@ -381,7 +382,7 @@ pub fn analyze(
             // A7.7.260      YIELD - T1
             continue;
         } else {
-            let second = halfwords.next().unwrap_or_else(|| bug!(first)).0;
+            let second: &[u8] = halfwords.next().unwrap_or_else(|| bug!(first)).0;
 
             const SP: u8 = 0b1101;
 
@@ -431,7 +432,7 @@ pub fn analyze(
                 // A7.7.249      VPUSH - T1
                 modifies_sp = true;
 
-                let imm8 = second[0] & 0b1111_1111;
+                let imm8 = second[0];
                 let imm32 = u32::from(imm8) << 2;
 
                 if let Some(stack) = stack.as_mut() {
@@ -444,7 +445,7 @@ pub fn analyze(
                 // A7.7.249      VPUSH - T2
                 modifies_sp = true;
 
-                let imm8 = second[0] & 0b1111_1111;
+                let imm8 = second[0];
                 let imm32 = u32::from(imm8) << 2;
 
                 if let Some(stack) = stack.as_mut() {
@@ -554,16 +555,13 @@ pub fn analyze(
                 if rn == SP {
                     modifies_sp = true;
 
-                    let imm8 = second[0] & 0b1111_1111;
+                    let imm8 = second[0];
                     let imm32 = u32::from(imm8);
 
                     if let Some(stack) = stack.as_mut() {
                         *stack += u64::from(imm32);
                     }
                 }
-            } else {
-                // some other 32-bit instruction
-                continue;
             }
         }
     }
@@ -574,16 +572,16 @@ pub fn analyze(
 fn matches(bytes: &[u8], pattern: &str) -> bool {
     assert!(pattern.starts_with("0b"));
 
-    let pattern = pattern[2..].replace("_", "");
+    let pattern = pattern[2..].replace('_', "");
     assert_eq!(pattern.len(), 16);
 
     let mask1 =
-        u8::from_str_radix(&pattern[..8].replace("0", "1").replace("x", "0"), 2).expect("BUG");
-    let value1 = u8::from_str_radix(&pattern[..8].replace("x", "0"), 2).expect("BUG");
+        u8::from_str_radix(&pattern[..8].replace('0', "1").replace('x', "0"), 2).expect("BUG");
+    let value1 = u8::from_str_radix(&pattern[..8].replace('x', "0"), 2).expect("BUG");
 
     let mask2 =
-        u8::from_str_radix(&pattern[8..].replace("0", "1").replace("x", "0"), 2).expect("BUG");
-    let value2 = u8::from_str_radix(&pattern[8..].replace("x", "0"), 2).expect("BUG");
+        u8::from_str_radix(&pattern[8..].replace('0', "1").replace('x', "0"), 2).expect("BUG");
+    let value2 = u8::from_str_radix(&pattern[8..].replace('x', "0"), 2).expect("BUG");
 
     let first = bytes[1];
     let second = bytes[0];

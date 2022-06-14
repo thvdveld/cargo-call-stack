@@ -7,7 +7,7 @@ use nom::{
     IResult,
 };
 
-use crate::ir::{define::Define, FnSig};
+use crate::llvm::{define::Define, FnSig};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Item<'a> {
@@ -217,7 +217,7 @@ pub fn item(i: &str) -> IResult<&str, Item> {
 
 #[cfg(test)]
 mod tests {
-    use crate::ir::{Declare, FnSig, Item, Type};
+    use crate::llvm::{Declare, FnSig, Item, Type};
 
     #[test]
     fn alias() {
@@ -268,6 +268,11 @@ mod tests {
 
     #[test]
     fn type_() {
+        assert_eq!(
+            super::type_("%0 = type { i32, { i8*, i8* } }"),
+            Ok(("", Item::Type))
+        );
+
         assert_eq!(
             super::type_("%\"blue_pill::ItmLogger\" = type {}"),
             Ok(("", Item::Type))

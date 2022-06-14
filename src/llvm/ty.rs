@@ -10,7 +10,7 @@ use nom::{
     IResult,
 };
 
-use crate::ir::FnSig;
+use crate::llvm::FnSig;
 
 // NOTE we don't keep track of pointers; `i8` and `i8*` are both considered `Type::Integer`
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -329,7 +329,7 @@ fn fn_inputs(i: &str) -> IResult<&str, Vec<Type>> {
 
 #[cfg(test)]
 mod tests {
-    use crate::ir::{FnSig, Type};
+    use crate::llvm::{FnSig, Type};
 
     #[test]
     fn fn_inputs() {

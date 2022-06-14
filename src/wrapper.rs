@@ -17,11 +17,6 @@ use std::{env, process::Command};
 
 use failure::format_err;
 
-pub(crate) const COMPILER_BUILTINS_RLIB_PATH_MARKER: &str =
-    "@CARGO_CALL_STACK:compiler_builtins_rlib_path@";
-pub(crate) const COMPILER_BUILTINS_LL_PATH_MARKER: &str =
-    "@CARGO_CALL_STACK:compiler_builtins_ll_path@";
-
 pub(crate) fn wrapper() -> Result<i32, failure::Error> {
     let mut args = env::args().skip(1);
     let rustc_path = args.next().unwrap();
@@ -31,11 +26,8 @@ pub(crate) fn wrapper() -> Result<i32, failure::Error> {
     let args = RustcArgs::parse(&mut rustc_args.iter().map(|s| &**s))?;
 
     for ext in &args.extern_crates {
-        match (&*ext.crate_name, &ext.path) {
-            ("compiler_builtins", Some(path)) => {
-                eprintln!("{}{}", COMPILER_BUILTINS_RLIB_PATH_MARKER, path);
-            }
-            _ => {}
+        if let Some(path) = &ext.path {
+            eprintln!("{}", path);
         }
     }
 
@@ -46,7 +38,7 @@ pub(crate) fn wrapper() -> Result<i32, failure::Error> {
             .out_dir
             .ok_or_else(|| format_err!("missing `--out-dir` argument"))?;
         let ll_path = format!("{}/{}{}.ll", out_dir, args.crate_name, args.extra_filename);
-        eprintln!("{}{}", COMPILER_BUILTINS_LL_PATH_MARKER, ll_path);
+        eprintln!("{}", ll_path);
     }
 
     rustc.arg("-Zemit-stack-sizes").args(&rustc_args);
@@ -121,24 +113,19 @@ impl RustcArgs {
                         next = args
                             .next()
                             .ok_or_else(|| format_err!("missing argument for `-C`"))?;
-                        arg = &next;
+                        arg = next;
                     }
 
                     let mut split = arg.splitn(2, '=');
                     let name = split.next().unwrap(); // cannot fail
 
-                    match name {
-                        "extra-filename" => {
-                            extra_filename = Some(
-                                split
-                                    .next()
-                                    .ok_or_else(|| {
-                                        format_err!("missing value for `-Cextra-filename`")
-                                    })?
-                                    .to_string(),
-                            );
-                        }
-                        _ => {}
+                    if let "extra-filename" = name {
+                        extra_filename = Some(
+                            split
+                                .next()
+                                .ok_or_else(|| format_err!("missing value for `-Cextra-filename`"))?
+                                .to_string(),
+                        );
                     }
                 }
                 _ => {}

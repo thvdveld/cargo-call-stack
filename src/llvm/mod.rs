@@ -15,8 +15,8 @@ mod define;
 mod item;
 mod ty;
 
-use crate::ir::ty::type_;
-pub use crate::ir::{
+use crate::llvm::ty::type_;
+pub use crate::llvm::{
     define::Stmt,
     item::{Declare, Item},
     ty::Type,
@@ -73,7 +73,7 @@ pub fn parse(ll: &str) -> Result<Vec<Item>, failure::Error> {
 }
 
 fn items(i: &str) -> IResult<&str, Vec<Item>> {
-    let (i, items) = separated_list(many1(line_ending), crate::ir::item::item)(i)?;
+    let (i, items) = separated_list(many1(line_ending), crate::llvm::item::item)(i)?;
     let i = many0(line_ending)(i)?.0;
     if i.is_empty() {
         Ok(("", items))
@@ -152,8 +152,8 @@ fn attribute(i: &str) -> IResult<&str, Attribute> {
 
         "align" => {
             let i = space1(i)?.0;
-            let i = digit1(i)?.0;
-            i
+
+            digit1(i)?.0
         }
 
         // have this branch always error because this is not an attribute but part of a type
@@ -242,7 +242,7 @@ fn getelementptr(i: &str) -> IResult<&str, GetElementPtr> {
 }
 
 fn name(i: &str) -> IResult<&str, &str> {
-    alt((map(string, |s| s.0), map(ident, |i| i.0)))(i)
+    alt((map(string, |s| s.0), map(ident, |i| i.0), digit1))(i)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

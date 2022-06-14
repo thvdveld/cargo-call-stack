@@ -1,5 +1,3 @@
-#![deny(warnings)]
-
 use core::{
     cmp,
     fmt::{self, Write as _},
@@ -18,7 +16,6 @@ use std::{
 
 use ar::Archive;
 use cargo_project::{Artifact, Profile, Project};
-use clap::{crate_authors, crate_version, App, Arg};
 use env_logger::{Builder, Env};
 use failure::format_err;
 use filetime::FileTime;
@@ -33,11 +30,11 @@ use walkdir::WalkDir;
 use xmas_elf::{sections::SectionData, symbol_table::Entry, ElfFile};
 
 use crate::{
-    ir::{FnSig, Item, Stmt, Type},
+    llvm::{FnSig, Item, Stmt, Type},
     thumb::Tag,
 };
 
-mod ir;
+mod llvm;
 mod thumb;
 mod wrapper;
 
@@ -54,104 +51,82 @@ fn main() -> Result<(), failure::Error> {
 // Font used in the dot graphs
 const FONT: &str = "monospace";
 
-#[allow(deprecated)]
-fn run() -> Result<i32, failure::Error> {
-    if env::var_os("CARGO_CALL_STACK_RUSTC_WRAPPER").is_some() {
-        return wrapper::wrapper();
-    }
+#[derive(Debug, Default)]
+pub struct CallStack {
+    pub compiler_builtins_ll: String,
+    pub compiler_builtins_rlib: String,
+    pub ll_files: Vec<String>,
+    pub rlib_files: Vec<String>,
+    pub exec_ll: PathBuf,
+    pub exec_o: PathBuf,
+    pub stack_sizes: HashMap<String, u64>,
+}
 
-    Builder::from_env(Env::default().default_filter_or("warn")).init();
+use clap::Parser;
 
-    let matches = App::new("cargo-call-stack")
-        .version(crate_version!())
-        .author(crate_authors!(", "))
-        .about("Generate a call graph and perform whole program stack usage analysis")
-        // as this is used as a Cargo subcommand the first argument will be the name of the binary
-        // we ignore this argument
-        .arg(Arg::with_name("binary-name").hidden(true))
-        .arg(
-            Arg::with_name("target")
-                .long("target")
-                .takes_value(true)
-                .value_name("TRIPLE")
-                .help("Target triple for which the code is compiled"),
-        )
-        .arg(
-            Arg::with_name("verbose")
-                .long("verbose")
-                .short("v")
-                .help("Use verbose output"),
-        )
-        .arg(
-            Arg::with_name("example")
-                .long("example")
-                .takes_value(true)
-                .value_name("NAME")
-                .help("Build only the specified example"),
-        )
-        .arg(
-            Arg::with_name("bin")
-                .long("bin")
-                .takes_value(true)
-                .value_name("BIN")
-                .help("Build only the specified binary"),
-        )
-        .arg(
-            Arg::with_name("features")
-                .long("features")
-                .takes_value(true)
-                .value_name("FEATURES")
-                .help("Space-separated list of features to activate"),
-        )
-        .arg(
-            Arg::with_name("all-features")
-                .long("all-features")
-                .takes_value(false)
-                .help("Activate all available features"),
-        )
-        .arg(
-            Arg::with_name("START").help("consider only the call graph that starts from this node"),
-        )
-        .get_matches();
-    let is_example = matches.is_present("example");
-    let is_binary = matches.is_present("bin");
-    let verbose = matches.is_present("verbose");
-    let target_flag = matches.value_of("target");
-    let profile = Profile::Release;
+#[derive(Parser, Debug)]
+#[clap(author, version, about, long_about = None)]
+pub struct Args {
+    /// Target triple for wich the code is compiled.
+    #[clap(long)]
+    target: Option<String>,
+    /// Build only the specified example.
+    #[clap(long)]
+    example: Option<String>,
+    /// Build only the specified binary.
+    #[clap(long)]
+    bin: Option<String>,
+    /// Space-separated list of features to activate.
+    #[clap(long)]
+    features: Option<String>,
+    /// Activate all features.
+    #[clap(name = "all-features", long)]
+    all_features: Option<bool>,
+    /// Use debug mode for compilation.
+    #[clap(long)]
+    debug: Option<bool>,
+    /// Print a table with the stack usage information instead of generating a dot file.
+    #[clap(long, short)]
+    list: bool,
+    /// Consider only the call graph from this function.
+    #[clap()]
+    start: Option<String>,
+}
 
-    let file;
-    match (is_example, is_binary) {
-        (true, false) => file = matches.value_of("example").unwrap(),
-        (false, true) => file = matches.value_of("bin").unwrap(),
-        _ => {
-            return Err(failure::err_msg(
-                "Please specify either --example <NAME> or --bin <NAME>.",
-            ));
-        }
-    }
-
+fn cargo_command(
+    matches: &Args,
+    profile: &Profile,
+) -> Result<(Command, bool, bool, String), failure::Error> {
     let mut cargo = Command::new("cargo");
     cargo.arg("rustc");
 
     // NOTE we do *not* use `project.target()` here because Cargo will figure things out on
     // its own (i.e. it will search and parse .cargo/config, etc.)
-    if let Some(target) = target_flag {
+    if let Some(target) = &matches.target {
         cargo.args(&["--target", target]);
     }
 
-    if matches.is_present("all-features") {
+    if let Some(true) = matches.all_features {
         cargo.arg("--all-features");
-    } else if let Some(features) = matches.value_of("features") {
+    } else if let Some(features) = &matches.features {
         cargo.args(&["--features", features]);
     }
 
-    if is_example {
-        cargo.args(&["--example", file]);
-    }
-
-    if is_binary {
-        cargo.args(&["--bin", file]);
-    }
+    let (file, is_binary, is_example) = match (&matches.bin, &matches.example) {
+        (Some(f), None) => {
+            cargo.args(&["--bin", f]);
+            (f, true, false)
+        }
+        (None, Some(f)) => {
+            cargo.args(&["--example", f]);
+            (f, false, true)
+        }
+        _ => {
+            return Err(failure::err_msg(
+                "Please specify either --example <NAME> or --bin <NAME>.",
+            ));
+        }
+    };
 
     if profile.is_release() {
         cargo.arg("--release");
@@ -161,7 +136,6 @@ fn run() -> Result<i32, failure::Error> {
         "-Zbuild-std",
         "--color=always",
         "--",
-        // .ll file
         "--emit=llvm-ir,obj",
         // needed to produce a single .ll file
         "-C",
@@ -174,53 +148,64 @@ fn run() -> Result<i32, failure::Error> {
     cargo.env("RUSTC_WRAPPER", env::current_exe()?);
     cargo.stderr(Stdio::piped());
 
+    Ok((cargo, is_binary, is_example, file.to_string()))
+}
+
+#[allow(deprecated)]
+fn run() -> Result<i32, failure::Error> {
+    Builder::from_env(Env::default().default_filter_or("warn")).init();
+
+    if env::var_os("CARGO_CALL_STACK_RUSTC_WRAPPER").is_some() {
+        return wrapper::wrapper();
+    }
+
+    let matches = Args::parse();
+
+    let target_flag = matches.target.clone();
+    let profile = match matches.debug {
+        Some(true) => Profile::Dev,
+        _ => Profile::Release,
+    };
+
+    let (mut cargo, is_binary, is_example, file) = cargo_command(&matches, &profile)?;
+
     let cwd = env::current_dir()?;
     let project = Project::query(cwd)?;
 
-    // "touch" some source file to trigger a rebuild
-    let root = project.toml().parent().expect("UNREACHABLE");
-    let now = FileTime::from_system_time(SystemTime::now());
-    if !filetime::set_file_times(root.join("src/main.rs"), now, now).is_ok() {
-        if !filetime::set_file_times(root.join("src/lib.rs"), now, now).is_ok() {
-            // look for some rust source file and "touch" it
-            let src = root.join("src");
-            let haystack = if src.exists() { &src } else { root };
+    // We touch the project, such that it gets recompiled.
+    touch_project(&project)?;
 
-            for entry in WalkDir::new(haystack) {
-                let entry = entry?;
-                let path = entry.path();
+    log::trace!("{:?}", cargo);
 
-                if path.extension().map(|ext| ext == "rs").unwrap_or(false) {
-                    filetime::set_file_times(path, now, now)?;
-                    break;
-                }
-            }
-        }
-    }
-
-    if verbose {
-        eprintln!("{:?}", cargo);
-    }
-
+    // Run our cargo command and catch the compiler builtin rlib path and ll path.
     let mut child = cargo.spawn()?;
     let stderr = BufReader::new(child.stderr.take().unwrap());
+
+    // Collect all rlib and ll files.
+    let mut rlib_files: Vec<String> = vec![];
+    let mut ll_files: Vec<String> = vec![];
     let mut compiler_builtins_rlib_path = None;
     let mut compiler_builtins_ll_path = None;
     for line in stderr.lines() {
         let line = line?;
-        if line.starts_with(wrapper::COMPILER_BUILTINS_RLIB_PATH_MARKER) {
-            let path = &line[wrapper::COMPILER_BUILTINS_RLIB_PATH_MARKER.len()..];
-            compiler_builtins_rlib_path = Some(path.to_string());
-        } else if line.starts_with(wrapper::COMPILER_BUILTINS_LL_PATH_MARKER) {
-            let path = &line[wrapper::COMPILER_BUILTINS_LL_PATH_MARKER.len()..];
-            compiler_builtins_ll_path = Some(path.to_string());
+
+        if line.ends_with(".rlib") && line.contains("compiler_builtin") {
+            compiler_builtins_rlib_path = Some(line.clone());
+        } else if line.ends_with(".rlib") {
+            rlib_files.push(line.clone());
+        } else if line.ends_with(".ll") && line.contains("compiler_builtin") {
+            compiler_builtins_ll_path = Some(line.clone());
+        } else if line.ends_with(".ll") {
+            ll_files.push(line.clone());
+        } else if line.ends_with(".rmeta") {
+            continue;
         } else {
-            eprintln!("{}", line);
+            eprintln!("{line}");
         }
     }
 
+    // Wait until the cargo command is finished.
     let status = child.wait()?;
-
     if !status.success() {
         return Ok(status.code().unwrap_or(1));
     }
@@ -230,23 +215,35 @@ fn run() -> Result<i32, failure::Error> {
     let compiler_builtins_ll_path =
         compiler_builtins_ll_path.expect("`compiler_builtins` LLVM IR unavailable");
 
+    log::trace!("rlib files:\n{rlib_files:#?}");
+    log::trace!("ll files:\n{ll_files:#?}");
+    log::trace!("compiler builtin rlib: {compiler_builtins_rlib_path}");
+    log::trace!("compiler builtin ll: {compiler_builtins_ll_path}");
+
+    let mut call_stack = CallStack::default();
+
+    call_stack.rlib_files = rlib_files;
+    call_stack.ll_files = ll_files;
+    call_stack.compiler_builtins_ll = compiler_builtins_ll_path;
+    call_stack.compiler_builtins_rlib = compiler_builtins_rlib_path;
+
     let meta = rustc_version::version_meta()?;
     let host = meta.host;
 
+    // Find the path of the executable
     let mut path: PathBuf = if is_example {
-        project.path(Artifact::Example(file), profile, target_flag, &host)?
+        project.path(
+            Artifact::Example(&file),
+            profile,
+            target_flag.as_deref(),
+            &host,
+        )?
     } else {
-        project.path(Artifact::Bin(file), profile, target_flag, &host)?
+        project.path(Artifact::Bin(&file), profile, target_flag.as_deref(), &host)?
     };
 
     let elf = fs::read(&path)
         .map_err(|e| format_err!("couldn't open ELF file `{}`: {}", path.display(), e))?;
-
-    // load llvm-ir file
-    let mut ll = None;
-    // most recently modified
-    let mut mrm = SystemTime::UNIX_EPOCH;
-    let prefix = format!("{}-", file.replace('-', "_"));
 
     path = path.parent().expect("unreachable").to_path_buf();
 
@@ -254,57 +251,69 @@ fn run() -> Result<i32, failure::Error> {
         path = path.join("deps"); // the .ll file is placed in ../deps
     }
 
+    // load llvm-ir file
+    let mut ll = None;
+    // most recently modified
+    let mut mrm = SystemTime::UNIX_EPOCH;
+    let prefix = format!("{}-", file.replace('-', "_"));
+
     for e in fs::read_dir(path)? {
         let e = e?;
         let p = e.path();
 
-        if p.extension().map(|e| e == "ll").unwrap_or(false) {
-            if p.file_stem()
+        if p.extension().map(|e| e == "ll").unwrap_or(false)
+            && p.file_stem()
                 .expect("unreachable")
                 .to_str()
                 .expect("unreachable")
                 .starts_with(&prefix)
-            {
-                let modified = e.metadata()?.modified()?;
-                if ll.is_none() {
-                    ll = Some(p);
-                    mrm = modified;
-                } else {
-                    if modified > mrm {
-                        ll = Some(p);
-                        mrm = modified;
-                    }
-                }
+        {
+            let modified = e.metadata()?.modified()?;
+            if ll.is_none() || modified > mrm {
+                ll = Some(p);
+                mrm = modified;
             }
         }
     }
 
-    let ll_path = ll.expect("unreachable");
-    let obj = ll_path.with_extension("o");
-    let ll = fs::read_to_string(&ll_path)
-        .map_err(|e| format_err!("couldn't read LLVM IR from `{}`: {}", ll_path.display(), e))?;
-    let obj = fs::read(&obj)
-        .map_err(|e| format_err!("couldn't read object file `{}`: {}", obj.display(), e))?;
+    call_stack.exec_ll = ll.unwrap();
+    call_stack.exec_o = call_stack.exec_ll.with_extension("o");
 
-    let compiler_builtins_ll = fs::read_to_string(&compiler_builtins_ll_path).map_err(|e| {
+    let ll = fs::read_to_string(&call_stack.exec_ll).map_err(|e| {
         format_err!(
-            "couldn't read `compiler_builtins` LLVM IR from `{}`: {}",
-            compiler_builtins_ll_path,
+            "couldn't read LLVM IR from `{}`: {}",
+            &call_stack.exec_ll.display(),
+            e
+        )
+    })?;
+    let obj = fs::read(&call_stack.exec_o).map_err(|e| {
+        format_err!(
+            "couldn't read object file `{}`: {}",
+            &call_stack.exec_o.display(),
             e
         )
     })?;
 
-    let items = crate::ir::parse(&ll).map_err(|e| {
+    let compiler_builtins_ll =
+        fs::read_to_string(&call_stack.compiler_builtins_ll).map_err(|e| {
+            format_err!(
+                "couldn't read `compiler_builtins` LLVM IR from `{}`: {}",
+                &call_stack.compiler_builtins_ll,
+                e
+            )
+        })?;
+
+    let items = crate::llvm::parse(&ll).map_err(|e| {
         format_err!(
             "failed to parse application's LLVM IR from `{}`: {}",
-            ll_path.display(),
+            &call_stack.exec_ll.display(),
             e
         )
     })?;
-    let compiler_builtins_items = crate::ir::parse(&compiler_builtins_ll).map_err(|e| {
+    let compiler_builtins_items = crate::llvm::parse(&compiler_builtins_ll).map_err(|e| {
         format_err!(
             "failed to parse `compiler_builtins` LLVM IR from `{}`: {}",
-            compiler_builtins_ll_path,
+            &call_stack.compiler_builtins_ll,
             e
         )
     })?;
@@ -324,7 +333,7 @@ fn run() -> Result<i32, failure::Error> {
         }
     }
 
-    let target = project.target().or(target_flag).unwrap_or(&host);
+    let target = project.target().or(target_flag.as_deref()).unwrap_or(&host);
 
     // we know how to analyze the machine code in the ELF file for these targets thus we have more
     // information and need less LLVM-IR hacks
@@ -336,15 +345,52 @@ fn run() -> Result<i32, failure::Error> {
 
     // extract stack size information
     // the `.o` file doesn't have address information so we just keep the stack usage information
-    let mut stack_sizes: HashMap<_, _> = stack_sizes::analyze_object(&obj)?
-        .into_iter()
-        .map(|(name, stack)| (name.to_owned(), stack))
-        .collect();
-
-    let mut ar = Archive::new(
-        File::open(&compiler_builtins_rlib_path)
-            .map_err(|e| format_err!("couldn't open `{}`: {}", compiler_builtins_rlib_path, e))?,
+    call_stack.stack_sizes.extend(
+        stack_sizes::analyze_object(&obj)?
+            .iter()
+            .map(|(k, v)| (k.to_string(), *v))
+            .collect::<HashMap<String, u64>>(),
     );
+
+    for rlib in &call_stack.rlib_files {
+        log::trace!("analyzing {rlib}");
+        let mut ar = Archive::new(
+            File::open(rlib).map_err(|e| format_err!("couldn't open `{}`: {}", rlib, e))?,
+        );
+
+        let mut buf = vec![];
+        while let Some(entry) = ar.next_entry() {
+            let mut entry = entry?;
+            let header = entry.header().clone();
+
+            let name = str::from_utf8(header.identifier()).unwrap();
+
+            if name.ends_with(".o") && !name.contains("alloc") {
+                buf.clear();
+                entry.read_to_end(&mut buf)?;
+                let objects: HashMap<String, u64> = match stack_sizes::analyze_object(&buf) {
+                    Ok(objects) => objects
+                        .into_iter()
+                        .map(|(name, stack)| (name.to_owned(), stack))
+                        .collect(),
+                    Err(e) => {
+                        log::warn!("failed to analyze {name}, because {e}");
+                        Default::default()
+                    }
+                };
+
+                call_stack.stack_sizes.extend(objects);
+            }
+        }
+    }
+
+    let mut ar = Archive::new(File::open(&call_stack.compiler_builtins_rlib).map_err(|e| {
+        format_err!(
+            "couldn't open `{}`: {}",
+            &call_stack.compiler_builtins_rlib,
+            e
+        )
+    })?);
 
     let mut buf = vec![];
     while let Some(entry) = ar.next_entry() {
@@ -357,11 +403,11 @@ fn run() -> Result<i32, failure::Error> {
         {
             buf.clear();
             entry.read_to_end(&mut buf)?;
-            stack_sizes.extend(
-                stack_sizes::analyze_object(&buf)?
-                    .into_iter()
-                    .map(|(name, stack)| (name.to_owned(), stack)),
-            );
+            let objects: HashMap<String, u64> = stack_sizes::analyze_object(&buf)?
+                .into_iter()
+                .map(|(name, stack)| (name.to_owned(), stack))
+                .collect();
+            call_stack.stack_sizes.extend(objects);
         }
     }
 
@@ -412,8 +458,8 @@ fn run() -> Result<i32, failure::Error> {
         let demangled = rustc_demangle::demangle(name).to_string();
 
         // `<crate::module::Type as crate::module::Trait>::method::hdeadbeef`
-        if demangled.starts_with("<") {
-            if let Some(rhs) = demangled.splitn(2, " as ").nth(1) {
+        if demangled.starts_with('<') {
+            if let Some(rhs) = demangled.split_once(" as ").map(|x| x.1) {
                 // rhs = `crate::module::Trait>::method::hdeadbeef`
                 let mut parts = rhs.splitn(2, ">::");
 
@@ -437,20 +483,22 @@ fn run() -> Result<i32, failure::Error> {
 
         let canonical_name = if names.len() > 1 {
             // if one of the aliases appears in the `stack_sizes` dictionary, use that
-            if let Some(needle) = names.iter().find(|name| stack_sizes.contains_key(&***name)) {
+            if let Some(needle) = names
+                .iter()
+                .find(|name| call_stack.stack_sizes.contains_key(&***name))
+            {
                 needle
             } else {
                 // otherwise, pick the first name that's not a tag
                 names
                     .iter()
-                    .filter_map(|&name| {
+                    .find_map(|&name| {
                         if name == "$a" || name.starts_with("$a.") {
                             None
                         } else {
                             Some(name)
                         }
                     })
-                    .next()
                     .expect("UNREACHABLE")
             }
         } else {
@@ -464,7 +512,7 @@ fn run() -> Result<i32, failure::Error> {
         let _out = addr2name.insert(address, canonical_name);
         debug_assert!(_out.is_none());
 
-        let stack = stack_sizes.get(canonical_name).cloned();
+        let stack = call_stack.stack_sizes.get(canonical_name).cloned();
         if stack.is_none() {
             if !target_.is_thumb() {
                 warn!("no stack usage information for `{}`", canonical_name);
@@ -483,13 +531,13 @@ fn run() -> Result<i32, failure::Error> {
 
         // trait methods look like `<crate::module::Type as crate::module::Trait>::method::h$hash`
         // default trait methods look like `crate::module::Trait::method::h$hash`
-        let is_trait_method = demangled.starts_with("<") && demangled.contains(" as ") || {
+        let is_trait_method = demangled.starts_with('<') && demangled.contains(" as ") || {
             dehash(&demangled)
                 .map(|path| default_methods.contains(path))
                 .unwrap_or(false)
         };
 
-        if let Some(def) = names.iter().filter_map(|name| defines.get(name)).next() {
+        if let Some(def) = names.iter().find_map(|name| defines.get(name)) {
             // if the signature is `fn(&_, &mut fmt::Formatter) -> fmt::Result`
             match (&def.sig.inputs[..], def.sig.output.as_ref()) {
                 ([Type::Pointer(..), Type::Pointer(fmt)], Some(output))
@@ -504,12 +552,7 @@ fn run() -> Result<i32, failure::Error> {
 
             let is_object_safe = is_trait_method && {
                 match def.sig.inputs.first().as_ref() {
-                    Some(Type::Pointer(ty)) => match **ty {
-                        // XXX can the receiver be a *specific* function? (e.g. `fn() {foo}`)
-                        Type::Fn(_) => false,
-
-                        _ => true,
-                    },
+                    Some(Type::Pointer(ty)) => !matches!(**ty, Type::Fn(_)),
                     _ => false,
                 }
             };
@@ -530,8 +573,7 @@ fn run() -> Result<i32, failure::Error> {
             }
         } else if let Some(sig) = names
             .iter()
-            .filter_map(|name| declares.get(name).and_then(|decl| decl.sig.clone()))
-            .next()
+            .find_map(|name| declares.get(name).and_then(|decl| decl.sig.clone()))
         {
             // sanity check (?)
             assert!(!is_trait_method, "BUG: undefined trait method");
@@ -967,7 +1009,7 @@ fn run() -> Result<i32, failure::Error> {
     } else {
         all_maybe_void
             .iter()
-            .filter_map(|maybe_void| {
+            .find_map(|maybe_void| {
                 // this could be `core::fmt::Void` or `core::fmt::Void.12`
                 if maybe_void.starts_with("core::fmt::Void") {
                     Some(*maybe_void)
@@ -975,7 +1017,6 @@ fn run() -> Result<i32, failure::Error> {
                     None
                 }
             })
-            .next()
             .or_else(|| {
                 if all_maybe_void.len() == 1 {
                     // we got a random type!
@@ -1031,10 +1072,8 @@ fn run() -> Result<i32, failure::Error> {
             // add an edge between this and a potential extern / untyped symbol
             let extern_sym = g.add_node(Node("?", None, false));
             g.add_edge(call, extern_sym, ());
-        } else {
-            if callees.is_empty() {
-                error!("BUG? no callees for `{}`", name);
-            }
+        } else if callees.is_empty() {
+            error!("BUG? no callees for `{}`", name);
         }
 
         for callee in callees {
@@ -1065,20 +1104,15 @@ fn run() -> Result<i32, failure::Error> {
     }
 
     // filter the call graph
-    if let Some(start) = matches.value_of("START") {
+    if let Some(start) = matches.start.as_deref() {
         let start = indices.get(start).cloned().or_else(|| {
             let start_ = start.to_owned() + "::h";
             let hits = indices
                 .keys()
-                .filter_map(|key| {
-                    if rustc_demangle::demangle(key)
+                .filter(|key| {
+                    rustc_demangle::demangle(key)
                         .to_string()
                         .starts_with(&start_)
-                    {
-                        Some(key)
-                    } else {
-                        None
-                    }
                 })
                 .collect::<Vec<_>>();
 
@@ -1224,9 +1258,150 @@ fn run() -> Result<i32, failure::Error> {
         }
     }
 
-    dot(g, &cycles)?;
+    if matches.list {
+        use comfy_table::modifiers::UTF8_ROUND_CORNERS;
+        use comfy_table::presets::UTF8_FULL;
+
+        let mut table = comfy_table::Table::new();
+        table
+            .set_content_arrangement(comfy_table::ContentArrangement::Dynamic)
+            .load_preset(UTF8_FULL)
+            .apply_modifier(UTF8_ROUND_CORNERS)
+            .set_header(vec!["", "Function", "Local", "Max", "Call count", "Calls"]);
+
+        let mut data = vec![];
+        for (i, n) in g.raw_nodes().iter().enumerate() {
+            let node = &n.weight;
+
+            let name = rustc_demangle::demangle(&node.name).to_string();
+            //if name.contains("<&T as core::fmt::Debug>::fmt")
+                //|| name.contains("<&T as core::fmt::Display>::fmt")
+                //|| name.contains("core::ptr::drop_in_place")
+            //{
+                //continue;
+            //}
+
+            let mut edges = vec![];
+            for edge in g.raw_edges() {
+                if edge.source().index() == i {
+                    edges.push(edge.target().index());
+                }
+            }
+
+            edges.dedup();
+
+            data.push((i, name, node.local, node.max, edges));
+        }
+
+        data.sort_by(|a, b| {
+            if let (Some(a), Some(b)) = (a.3, b.3) {
+                match (a, b) {
+                    (Max::Exact(a), Max::Exact(b)) => {
+                        b.partial_cmp(&a).unwrap_or(cmp::Ordering::Greater)
+                    }
+                    (Max::Exact(a), Max::LowerBound(b)) => {
+                        b.partial_cmp(&a).unwrap_or(cmp::Ordering::Greater)
+                    }
+                    (Max::LowerBound(a), Max::Exact(b)) => {
+                        b.partial_cmp(&a).unwrap_or(cmp::Ordering::Greater)
+                    }
+                    (Max::LowerBound(a), Max::LowerBound(b)) => {
+                        b.partial_cmp(&a).unwrap_or(cmp::Ordering::Greater)
+                    }
+                }
+            } else {
+                cmp::Ordering::Less
+            }
+        });
+
+        for i in 0..data.len() {
+            let (index, _, _, _, _) = &mut data[i];
+            let old_index = *index;
+            *index = i;
+
+            for (_, _, _, _, edges) in data.iter_mut() {
+                for e in edges.iter_mut() {
+                    if *e == old_index {
+                        *e = i;
+                    }
+                }
+                edges.sort_unstable();
+            }
+        }
+
+        for (index, name, local, max, edges) in &data {
+            table.add_row(vec![
+                index.to_string(),
+                name.to_string(),
+                local.to_string(),
+                if let Some(m) = max {
+                    m.to_string()
+                } else {
+                    '?'.to_string()
+                },
+                {
+                    let mut count = 0;
+                    for (_, _, _, _, edges) in &data {
+                        for e in edges {
+                            if *e == *index {
+                                count += 1;
+                            }
+                        }
+                    }
+                    count.to_string()
+                },
+                {
+                    let mut t = comfy_table::Table::new();
+                    t.set_content_arrangement(comfy_table::ContentArrangement::Dynamic);
+                    t.load_preset(comfy_table::presets::NOTHING);
+                    edges.iter().for_each(|e| {
+                        data.iter().find(|x| x.0 == *e).iter().for_each(|x| {
+                            t.add_row(vec![
+                                x.2.clone().to_string(),
+                                if let Some(m) = x.3 {
+                                    m.to_string()
+                                } else {
+                                    '?'.to_string()
+                                },
+                                x.1.clone(),
+                            ]);
+                        });
+                    });
+                    t.to_string()
+                },
+            ]);
+        }
+
+        println!("{table}");
+    } else {
+        dot(g, &cycles)?;
+    }
 
     Ok(0)
+}
+
+fn touch_project(project: &Project) -> Result<(), failure::Error> {
+    let root = project.toml().parent().expect("UNREACHABLE");
+    let now = FileTime::from_system_time(SystemTime::now());
+    if filetime::set_file_times(root.join("src/main.rs"), now, now).is_err()
+        && filetime::set_file_times(root.join("src/lib.rs"), now, now).is_err()
+    {
+        // look for some rust source file and "touch" it
+        let src = root.join("src");
+        let haystack = if src.exists() { &src } else { root };
+
+        for entry in WalkDir::new(haystack) {
+            let entry = entry?;
+            let path = entry.path();
+
+            if path.extension().map(|ext| ext == "rs").unwrap_or(false) {
+                filetime::set_file_times(path, now, now)?;
+                break;
+            }
+        }
+    };
+
+    Ok(())
 }
 
 fn dot(g: Graph<Node, ()>, cycles: &[Vec<NodeIndex>]) -> io::Result<()> {
@@ -1317,9 +1492,8 @@ where
 
     fn write_char(&mut self, c: char) -> fmt::Result {
         match (|| -> io::Result<()> {
-            match c {
-                '"' => write!(self.writer, "\\")?,
-                _ => {}
+            if let '"' = c {
+                write!(self.writer, "\\")?
             }
 
             write!(self.writer, "{}", c)
@@ -1356,7 +1530,7 @@ where
 }
 
 /// Local stack usage
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, PartialOrd)]
 enum Local {
     Exact(u64),
     Unknown,
@@ -1371,9 +1545,9 @@ impl fmt::Display for Local {
     }
 }
 
-impl Into<Max> for Local {
-    fn into(self) -> Max {
-        match self {
+impl From<Local> for Max {
+    fn from(val: Local) -> Self {
+        match val {
             Local::Exact(n) => Max::Exact(n),
             Local::Unknown => Max::LowerBound(0),
         }

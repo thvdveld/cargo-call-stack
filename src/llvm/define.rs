@@ -8,7 +8,7 @@ use nom::{
     IResult,
 };
 
-use crate::ir::{FnSig, Type};
+use crate::llvm::{FnSig, Type};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Define<'a> {
@@ -161,6 +161,7 @@ fn argument(i: &str) -> IResult<&str, Argument> {
         map(super::bitcast, drop),
         map(super::getelementptr, drop),
         map(super::local, drop),
+        map(super::function, drop),
         map(digit1, drop),
     ))(i)?
     .0;
@@ -229,8 +230,8 @@ fn indirect_call(i: &str) -> IResult<&str, Stmt> {
     let i = space1(i)?.0;
     let i = char('%')(i)?.0;
     let i = opt(char('_'))(i)?.0;
-    let i = digit1(i)?.0;
-    let i = many0(|i| tag(".i")(i))(i)?.0;
+    let i = alt((digit1, map(super::ident, |s| s.0)))(i)?.0;
+    let i = many0(|i| alt((tag(".i"), digit1))(i))(i)?.0;
     let (i, inputs) = delimited(
         char('('),
         separated_list(
@@ -288,7 +289,7 @@ fn stmt(i: &str) -> IResult<&str, Stmt> {
 #[cfg(test)]
 mod tests {
     use super::{Argument, Define, Parameter};
-    use crate::ir::{FnSig, Stmt, Type};
+    use crate::llvm::{FnSig, Stmt, Type};
 
     #[test]
     fn argument() {
@@ -711,5 +712,20 @@ mod tests {
                 }
             ))
         );
+
+        assert!(super::parse(include_str!("define/parse8.ll").trim()).is_ok(),);
+
+        assert!(super::parse(include_str!("define/parse9.ll").trim()).is_ok(),);
+
+        assert!(super::parse(include_str!("define/parse10.ll").trim()).is_ok(),);
+
+        //assert!(
+        //super::parse(include_str!("define/parse11.ll").trim()).is_ok(),
+        //);
+
+        assert_eq!(
+            crate::llvm::parse(include_str!("define/parse11.ll").trim()).unwrap(),
+            vec![]
+        )
     }
 }
